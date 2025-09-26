@@ -21,7 +21,10 @@ function ensureDataFiles() {
   }
   for (const f of [ALL_IDS_FILE, SUCCESS_FILE, PROGRESS_FILE]) {
     if (!fs.existsSync(f)) {
-      fs.writeFileSync(f, f === PROGRESS_FILE ? JSON.stringify({ lastIndex: 0 }, null, 2) : '[]');
+      fs.writeFileSync(
+        f,
+        f === PROGRESS_FILE ? JSON.stringify({ lastIndex: 0 }, null, 2) : '[]'
+      );
     }
   }
 }
@@ -37,12 +40,23 @@ function readJsonArraySafe(filePath: string): any[] {
   }
 }
 
+/** Lee el índice de progreso con tolerancia a errores */
+function readProgressIndex(): number {
+  try {
+    const raw = fs.readFileSync(PROGRESS_FILE, 'utf8');
+    const parsed = JSON.parse(raw);
+    const n = Number(parsed?.lastIndex ?? 0);
+    return Number.isFinite(n) && n >= 0 ? n : 0;
+  } catch {
+    return 0;
+  }
+}
+
 /** Añade un lote (array) de elementos al archivo-JSON que contiene un arreglo */
 async function appendBatchToArrayFile(filePath: string, batch: any[]) {
   if (batch.length === 0) return;
   const arr = readJsonArraySafe(filePath);
-  // concatenación masiva para minimizar escrituras
-  Array.prototype.push.apply(arr, batch);
+  Array.prototype.push.apply(arr, batch); // concatenación masiva
   await fs.promises.writeFile(filePath, JSON.stringify(arr, null, 2));
 }
 
@@ -57,8 +71,19 @@ async function getClientMeta(page: import('puppeteer').Page) {
   return { userAgent, platform, screenSize };
 }
 
+/**
+ * Recorre TODAS las secuencias, pero reanuda desde `startIndex` (si > 0).
+ * Esto evita recalcular combinatorias complejas. El “salto” simplemente
+ * descarta las primeras `startIndex` secuencias del generador.
+ */
 export async function getUsersAssignment() {
   ensureDataFiles();
+
+  // Lee el índice inicial desde progress.json (si existe)
+  const startIndex = readProgressIndex();
+  if (startIndex > 0) {
+    console.log(`Reanudando desde lastIndex=${startIndex}`);
+  }
 
   const url = 'https://admisiongrado.unemi.edu.ec';
 
@@ -81,7 +106,8 @@ export async function getUsersAssignment() {
 
   // 4) Procesamiento en lotes (concurrencia = BATCH_SIZE)
   const gen = generateSequences();
-  let index = 0;
+  let index = 0; // índice global real (0..N)
+  let scheduled = 0; // cuántas tareas se han programado en esta corrida
   let pending: Promise<{
     allIdsEntry: Record<string, unknown>;
     successEntry?: Record<string, unknown>;
@@ -89,20 +115,25 @@ export async function getUsersAssignment() {
 
   try {
     for (const seq of gen) {
-      // programar request; ya no escribe a disco: devuelve los registros a persistir
-      const p = requestForKeyWithBackoff(seq, index);
-      // envolvemos para que nunca rechace y podamos usar Promise.allSettled eficientemente
-      pending.push(
-        p
-          .then((res) => res)
-          .catch((err) => {
-            console.error(`Error en clave ${fixedPrefix + seq} [${index}]:`, err);
-            return null;
-          })
-      );
+      // Si aún no alcanzamos el índice guardado, saltar
+      if (index < startIndex) {
+        index++;
+        continue;
+      }
 
+      // programar request; devuelve registros a persistir (nunca rechaza)
+      const p = requestForKeyWithBackoff(seq, index)
+        .then((res) => res)
+        .catch((err) => {
+          console.error(`Error en clave ${fixedPrefix + seq} [${index}]:`, err);
+          return null;
+        });
+
+      pending.push(p);
+      scheduled++;
       index++;
 
+      // Cuando el buffer alcanza el tamaño del lote, flush a disco + progreso
       if (pending.length === BATCH_SIZE) {
         const results = await Promise.allSettled(pending);
         const allIdsBatch: Record<string, unknown>[] = [];
@@ -117,17 +148,22 @@ export async function getUsersAssignment() {
 
         await appendBatchToArrayFile(ALL_IDS_FILE, allIdsBatch);
         await appendBatchToArrayFile(SUCCESS_FILE, successBatch);
-        await fs.promises.writeFile(PROGRESS_FILE, JSON.stringify({ lastIndex: index }, null, 2));
+        await fs.promises.writeFile(
+          PROGRESS_FILE,
+          JSON.stringify({ lastIndex: index }, null, 2)
+        );
 
-        console.log(`Progreso: ${index} claves procesadas (lote ${BATCH_SIZE}).`);
+        console.log(
+          `Progreso: ${index} claves procesadas (lote=${BATCH_SIZE}, programadas=${scheduled}).`
+        );
         pending = [];
       }
 
       // (opcional de pruebas)
-      // if (index >= 5000) break;
+      // if (scheduled >= 5000) break;
     }
 
-    // Vaciar resto
+    // Vaciar resto (si hay)
     if (pending.length > 0) {
       const results = await Promise.allSettled(pending);
       const allIdsBatch: Record<string, unknown>[] = [];
@@ -142,9 +178,14 @@ export async function getUsersAssignment() {
 
       await appendBatchToArrayFile(ALL_IDS_FILE, allIdsBatch);
       await appendBatchToArrayFile(SUCCESS_FILE, successBatch);
-      await fs.promises.writeFile(PROGRESS_FILE, JSON.stringify({ lastIndex: index }, null, 2));
+      await fs.promises.writeFile(
+        PROGRESS_FILE,
+        JSON.stringify({ lastIndex: index }, null, 2)
+      );
 
-      console.log(`Progreso final: ${index} claves procesadas (resto ${pending.length}).`);
+      console.log(
+        `Progreso final: ${index} claves procesadas (resto=${pending.length}, programadas=${scheduled}).`
+      );
     }
   } finally {
     clearInterval(refreshHandle);

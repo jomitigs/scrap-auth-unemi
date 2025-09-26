@@ -72,7 +72,6 @@ export async function requestForKey(seq: string, index: number) {
       'Content-Type': 'application/json',
     },
     body: JSON.stringify(requestBody),
-    // keepalive no aplica aquí en Node fetch; omitimos para evitar warnings
   });
 
   const json = await response.json();
@@ -102,7 +101,7 @@ export async function requestForKeyWithBackoff(
     const { fullID, json } = await requestForKey(seq, index);
     const at = new Date().toISOString();
 
-    // Construir registro maestro SIEMPRE
+    // Registro maestro SIEMPRE
     const allIdsEntry: Record<string, unknown> = {
       [fullID]: { index, at, response: json },
     };
@@ -112,7 +111,7 @@ export async function requestForKeyWithBackoff(
     const hasInvalidLiteral =
       !!msg && msg.toLowerCase().includes('invalid literal for int() with base 10');
 
-    // Caso éxito
+    // Caso éxito (estructura esperada)
     if (json?.data && Array.isArray(json.data.list_standby)) {
       const successEntry = {
         index,
@@ -125,24 +124,22 @@ export async function requestForKeyWithBackoff(
 
     // Caso error terminal controlado: NO reintentar
     if (hasInvalidLiteral) {
-      // devolvemos sólo el maestro; no hay success
       return { allIdsEntry };
     }
 
-    // Caso "no data" u otras respuestas no estándar: se considera final SIN reintento
-    // (si quisieras reintentar sólo cuando sea 5xx o network error, puedes ajustar aquí)
+    // Caso "message" u otras respuestas no estándar: se considera final SIN reintento
     if (msg) {
       return { allIdsEntry };
     }
 
-    // Respuesta inesperada sin message: podemos decidir reintentar
+    // Respuesta inesperada sin message: reintentar con backoff
     if (attempt < maxAttempts) {
       const backoffTime = Math.pow(2, attempt) * 1000;
       await delay(backoffTime);
       return requestForKeyWithBackoff(seq, index, attempt + 1);
     }
 
-    // si agotó reintentos, devolver maestro y listo
+    // agotó reintentos
     return { allIdsEntry };
   } catch (err: any) {
     // Errores de red / fetch: reintentos con backoff hasta agotar
@@ -151,7 +148,7 @@ export async function requestForKeyWithBackoff(
       await delay(backoffTime);
       return requestForKeyWithBackoff(seq, index, attempt + 1);
     }
-    // devolver un registro de error en response
+    // Devolver registro de error en response
     const fullID = fixedPrefix + seq;
     const allIdsEntry: Record<string, unknown> = {
       [fullID]: {
