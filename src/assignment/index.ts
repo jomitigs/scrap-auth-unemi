@@ -1,4 +1,3 @@
-// src/assignment/index.ts
 import { createBrowser } from '../utils/create-browser.js';
 import { login, refreshToken } from './login-token.js';
 import {
@@ -8,35 +7,23 @@ import {
   DATA_DIR,
   requestForKeyWithBackoff,
   BATCH_SIZE,
-  ALL_IDS_FILE,
-  SUCCESS_FILE,
+  ALL_IDS_DIR,
+  SUCCESS_DIR,
+  RotatingNdjsonWriter,
 } from './manage-data.js';
 import fs from 'node:fs';
 
-/** Garantiza la existencia de la carpeta de datos y archivos JSON base */
+/** Garantiza la existencia de carpeta de datos y subcarpetas */
 function ensureDataFiles() {
   if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
     console.log(`Carpeta creada: ${DATA_DIR}`);
   }
-  for (const f of [ALL_IDS_FILE, SUCCESS_FILE, PROGRESS_FILE]) {
-    if (!fs.existsSync(f)) {
-      fs.writeFileSync(
-        f,
-        f === PROGRESS_FILE ? JSON.stringify({ lastIndex: 0 }, null, 2) : '[]'
-      );
-    }
-  }
-}
+  if (!fs.existsSync(ALL_IDS_DIR)) fs.mkdirSync(ALL_IDS_DIR, { recursive: true });
+  if (!fs.existsSync(SUCCESS_DIR)) fs.mkdirSync(SUCCESS_DIR, { recursive: true });
 
-/** Lee un arreglo JSON con tolerancia a errores */
-function readJsonArraySafe(filePath: string): any[] {
-  try {
-    const raw = fs.readFileSync(filePath, 'utf8');
-    const parsed = JSON.parse(raw);
-    return Array.isArray(parsed) ? parsed : [];
-  } catch {
-    return [];
+  if (!fs.existsSync(PROGRESS_FILE)) {
+    fs.writeFileSync(PROGRESS_FILE, JSON.stringify({ lastIndex: 0 }, null, 2));
   }
 }
 
@@ -52,12 +39,9 @@ function readProgressIndex(): number {
   }
 }
 
-/** Añade un lote (array) de elementos al archivo-JSON que contiene un arreglo */
-async function appendBatchToArrayFile(filePath: string, batch: any[]) {
-  if (batch.length === 0) return;
-  const arr = readJsonArraySafe(filePath);
-  Array.prototype.push.apply(arr, batch); // concatenación masiva
-  await fs.promises.writeFile(filePath, JSON.stringify(arr, null, 2));
+/** Escribe el progreso de forma segura (archivo pequeño) */
+async function writeProgressIndex(index: number) {
+  await fs.promises.writeFile(PROGRESS_FILE, JSON.stringify({ lastIndex: index }, null, 2));
 }
 
 /** Captura metadatos reales del navegador para usarlos en el login */
@@ -72,14 +56,13 @@ async function getClientMeta(page: import('puppeteer').Page) {
 }
 
 /**
- * Recorre TODAS las secuencias, pero reanuda desde `startIndex` (si > 0).
- * Esto evita recalcular combinatorias complejas. El “salto” simplemente
- * descarta las primeras `startIndex` secuencias del generador.
+ * Procesa todas las secuencias con escritura NDJSON por partes.
+ * Reanuda desde progress.json y continúa en la última parte creada.
  */
 export async function getUsersAssignment() {
   ensureDataFiles();
 
-  // Lee el índice inicial desde progress.json (si existe)
+  // Índice inicial desde progress.json (si existe)
   const startIndex = readProgressIndex();
   if (startIndex > 0) {
     console.log(`Reanudando desde lastIndex=${startIndex}`);
@@ -104,7 +87,21 @@ export async function getUsersAssignment() {
     refreshToken().catch((e) => console.warn('Refresh token error:', e?.message || e));
   }, 5 * 60 * 1000);
 
-  // 4) Procesamiento en lotes (concurrencia = BATCH_SIZE)
+  // 4) Writers NDJSON con rotación por peso/líneas (recuperan estado real de disco)
+  const allIdsWriter = new RotatingNdjsonWriter(ALL_IDS_DIR, {
+    maxBytesPerPart: 250 * 1024 * 1024, // 250 MB
+    maxLinesPerPart: 500_000,
+  });
+  const successWriter = new RotatingNdjsonWriter(SUCCESS_DIR, {
+    maxBytesPerPart: 250 * 1024 * 1024,
+    maxLinesPerPart: 500_000,
+  });
+
+  // Recuperar última parte, bytes y líneas reales para continuar sin sobrescribir
+  await allIdsWriter.recoverStateFromDisk();
+  await successWriter.recoverStateFromDisk();
+
+  // 5) Procesamiento en lotes (concurrencia = BATCH_SIZE)
   const gen = generateSequences();
   let index = 0; // índice global real (0..N)
   let scheduled = 0; // cuántas tareas se han programado en esta corrida
@@ -115,19 +112,21 @@ export async function getUsersAssignment() {
 
   try {
     for (const seq of gen) {
-      // Si aún no alcanzamos el índice guardado, saltar
+      // Saltar hasta el índice guardado
       if (index < startIndex) {
         index++;
         continue;
       }
 
       // programar request; devuelve registros a persistir (nunca rechaza)
-      const p = requestForKeyWithBackoff(seq, index)
-        .then((res) => res)
-        .catch((err) => {
+      const p = (async () => {
+        try {
+          return await requestForKeyWithBackoff(seq, index);
+        } catch (err) {
           console.error(`Error en clave ${fixedPrefix + seq} [${index}]:`, err);
           return null;
-        });
+        }
+      })();
 
       pending.push(p);
       scheduled++;
@@ -146,12 +145,9 @@ export async function getUsersAssignment() {
           }
         }
 
-        await appendBatchToArrayFile(ALL_IDS_FILE, allIdsBatch);
-        await appendBatchToArrayFile(SUCCESS_FILE, successBatch);
-        await fs.promises.writeFile(
-          PROGRESS_FILE,
-          JSON.stringify({ lastIndex: index }, null, 2)
-        );
+        await allIdsWriter.appendBatch(allIdsBatch);
+        await successWriter.appendBatch(successBatch);
+        await writeProgressIndex(index);
 
         console.log(
           `Progreso: ${index} claves procesadas (lote=${BATCH_SIZE}, programadas=${scheduled}).`
@@ -176,12 +172,9 @@ export async function getUsersAssignment() {
         }
       }
 
-      await appendBatchToArrayFile(ALL_IDS_FILE, allIdsBatch);
-      await appendBatchToArrayFile(SUCCESS_FILE, successBatch);
-      await fs.promises.writeFile(
-        PROGRESS_FILE,
-        JSON.stringify({ lastIndex: index }, null, 2)
-      );
+      await allIdsWriter.appendBatch(allIdsBatch);
+      await successWriter.appendBatch(successBatch);
+      await writeProgressIndex(index);
 
       console.log(
         `Progreso final: ${index} claves procesadas (resto=${pending.length}, programadas=${scheduled}).`

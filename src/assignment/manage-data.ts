@@ -1,16 +1,17 @@
-// src/assignment/manage-data.ts
 import path from 'node:path';
 import fs from 'node:fs';
 import { token } from './login-token.js';
 import { assignment } from '../config/setting.js';
 
-/** Estructura de carpetas: <project-root>/data/assignment */
+/** Directorios base */
 export const DATA_DIR = path.join(process.cwd(), 'data', 'assignment');
 
-// Archivos de salida
-export const ALL_IDS_FILE = path.join(DATA_DIR, 'allIDs.json');       // [{ fullID: { index, at, response } }, ...]
-export const SUCCESS_FILE = path.join(DATA_DIR, 'dataResults.json');  // [{ index, fullID, data, at }, ...]
-export const PROGRESS_FILE = path.join(DATA_DIR, 'progress.json');    // { lastIndex }
+/** Subcarpetas para partes NDJSON */
+export const ALL_IDS_DIR = path.join(DATA_DIR, 'allIDs');
+export const SUCCESS_DIR = path.join(DATA_DIR, 'dataResults');
+
+/** Archivo de progreso pequeño */
+export const PROGRESS_FILE = path.join(DATA_DIR, 'progress.json'); // { lastIndex }
 
 /** Parámetros de generación de claves */
 export const fixedPrefix = 'OPPQQRRSSTTUUU'; // 14 caracteres fijos
@@ -19,6 +20,10 @@ export const sequenceLength = 6; // 6 letras -> total key 20 (14 + 6)
 
 /** Concurrencia por lote declarada en settings (se asume 1000) */
 export const BATCH_SIZE = Number(assignment.maxRequest) || 1000;
+
+function delay(ms: number) {
+  return new Promise((res) => setTimeout(res, ms));
+}
 
 // ---------- Generador de secuencias ----------
 export function* generateSequences() {
@@ -45,8 +50,161 @@ export function* generateSequences() {
   }
 }
 
-function delay(ms: number) {
-  return new Promise((res) => setTimeout(res, ms));
+/** Opciones de rotación */
+type RotateOptions = {
+  maxBytesPerPart?: number;   // p.ej. 250 MB
+  maxLinesPerPart?: number;   // p.ej. 500k líneas
+};
+
+/** Estado interno */
+type MetaState = {
+  part: number;
+  lines: number;
+  bytes: number;
+};
+
+/** Cuenta líneas de un archivo mediante stream (eficiente y sin choques de tipos) */
+async function countFileLines(filePath: string): Promise<number> {
+  return new Promise((resolve, reject) => {
+    let count = 0;
+    const rs = fs.createReadStream(filePath); // sin encoding -> chunk puede ser Buffer
+    rs.on('data', (chunk: any) => {
+      // Normalizamos a Buffer
+      const buf: Buffer = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk));
+      // 0x0a == '\n'
+      for (let i = 0; i < buf.length; i++) {
+        if (buf[i] === 0x0a) count++;
+      }
+    });
+    rs.on('end', () => resolve(count));
+    rs.on('error', reject);
+  });
+}
+
+/** Lista partes existentes y devuelve el número de parte máximo (0 si no hay) */
+function findLatestPartNumber(dir: string): number {
+  if (!fs.existsSync(dir)) return 0;
+  const files = fs.readdirSync(dir);
+  let max = 0;
+  for (const f of files) {
+    // Formato: part-000001.ndjson
+    const m = /^part-(\d{6})\.ndjson$/.exec(f);
+    if (m) {
+      const captured = m[1]; // string | undefined
+      if (captured) {
+        const n = parseInt(captured, 10);
+        if (Number.isFinite(n) && n > max) max = n;
+      }
+    }
+  }
+  return max;
+}
+
+/** Crea nombre de archivo por parte */
+function partFileName(part: number): string {
+  return `part-${String(part).padStart(6, '0')}.ndjson`;
+}
+
+/** Writer NDJSON con rotación por tamaño y/o líneas, en subcarpeta dedicada */
+export class RotatingNdjsonWriter {
+  private dir: string;                 // p.ej. data/assignment/allIDs
+  private metaPath: string;            // p.ej. data/assignment/allIDs/meta.json
+  private opts: Required<RotateOptions>;
+  private state: MetaState;
+
+  constructor(targetDir: string, opts: RotateOptions = {}) {
+    this.dir = targetDir;
+    this.metaPath = path.join(targetDir, 'meta.json');
+    this.opts = {
+      maxBytesPerPart: opts.maxBytesPerPart ?? 250 * 1024 * 1024, // 250 MB
+      maxLinesPerPart: opts.maxLinesPerPart ?? 500_000,           // 500k líneas
+    };
+    this.ensureDir();
+    this.state = { part: 1, lines: 0, bytes: 0 };
+  }
+
+  /** Asegura la existencia del directorio y lo inicializa si está vacío */
+  private ensureDir() {
+    if (!fs.existsSync(this.dir)) fs.mkdirSync(this.dir, { recursive: true });
+  }
+
+  /** Ruta del archivo actual (parte activa) */
+  private currentPartPath(): string {
+    return path.join(this.dir, partFileName(this.state.part));
+  }
+
+  /** Carga estado desde disco con preferencia por la realidad (archivos) */
+  async recoverStateFromDisk() {
+    // 1) Detectar última parte real
+    const latest = findLatestPartNumber(this.dir);
+    if (latest === 0) {
+      // No hay partes: iniciamos en part=1 con archivo vacío
+      this.state = { part: 1, lines: 0, bytes: 0 };
+      fs.writeFileSync(this.currentPartPath(), '');
+      await this.flushMeta();
+      return;
+    }
+
+    // 2) Usar la última parte encontrada
+    this.state.part = latest;
+    const p = this.currentPartPath();
+
+    // 3) Obtener bytes reales
+    const st = fs.statSync(p);
+    this.state.bytes = st.size;
+
+    // 4) Calcular líneas reales de la última parte
+    this.state.lines = await countFileLines(p);
+
+    await this.flushMeta();
+  }
+
+  /** Guarda meta.json pequeño y consistente */
+  private async flushMeta() {
+    const data: MetaState = {
+      part: this.state.part,
+      lines: this.state.lines,
+      bytes: this.state.bytes,
+    };
+    await fs.promises.writeFile(this.metaPath, JSON.stringify(data, null, 2), 'utf8');
+  }
+
+  /** Rotación: avanza a la siguiente parte */
+  private async rotate() {
+    this.state.part += 1;
+    this.state.lines = 0;
+    this.state.bytes = 0;
+    const next = this.currentPartPath();
+    if (!fs.existsSync(next)) fs.writeFileSync(next, '');
+    await this.flushMeta();
+  }
+
+  private needsRotate(incomingBytes: number, incomingLines: number): boolean {
+    const overBytes = (this.state.bytes + incomingBytes) > this.opts.maxBytesPerPart;
+    const overLines = (this.state.lines + incomingLines) > this.opts.maxLinesPerPart;
+    return overBytes || overLines;
+  }
+
+  /** Añade lote como NDJSON (una línea por objeto), con rotación automática */
+  async appendBatch(objs: Record<string, unknown>[]) {
+    if (!objs.length) return;
+
+    // Serializamos sin pretty-print para ahorrar bytes
+    const linesStr = objs.map(o => JSON.stringify(o)).join('\n') + '\n';
+    const incomingBytes = Buffer.byteLength(linesStr, 'utf8');
+    const incomingLines = objs.length;
+
+    if (this.needsRotate(incomingBytes, incomingLines)) {
+      await this.rotate();
+    }
+
+    const filePath = this.currentPartPath();
+    await fs.promises.appendFile(filePath, linesStr, 'utf8');
+
+    this.state.bytes += incomingBytes;
+    this.state.lines += incomingLines;
+    await this.flushMeta();
+  }
 }
 
 // ---------- Requests ----------
@@ -80,7 +238,7 @@ export async function requestForKey(seq: string, index: number) {
 
 /**
  * Reintentos exponenciales (máx 5).
- * Regresa objetos para escritura por lote:
+ * Regresa objetos para escritura por lote (forma exacta solicitada):
  * - allIdsEntry: { [fullID]: { index, at, response } }
  * - successEntry?: { index, fullID, data, at }
  *
@@ -101,7 +259,7 @@ export async function requestForKeyWithBackoff(
     const { fullID, json } = await requestForKey(seq, index);
     const at = new Date().toISOString();
 
-    // Registro maestro SIEMPRE
+    // Registro maestro SIEMPRE (mantener forma solicitada)
     const allIdsEntry: Record<string, unknown> = {
       [fullID]: { index, at, response: json },
     };
